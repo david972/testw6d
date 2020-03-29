@@ -1,0 +1,537 @@
+variables:
+  REGISTRY: reg-ext.w6d.io
+  CONTAINER_IMAGE: ${REGISTRY}/w6d/${CI_PROJECT_PATH_SLUG}
+  DOCKER_DRIVER: overlay2
+  JOB_USER: "gitlab-ci-token"
+
+stages:
+  - build
+  - deploy
+  - cleanup
+
+
+build:node:
+  stage: build
+  script:
+    - export CONTAINER_IMAGE=`echo ${CONTAINER_IMAGE} | tr '[:upper:]' '[:lower:]'`
+    - |
+        docker build --build-arg VCS_REF=$(git rev-parse --short HEAD)                  \
+                     --build-arg BUILD_DATE=`date -u +"%%Y-%%m-%%dT%%H:%%M:%%SZ"`       \
+                     --build-arg VERSION="${CI_COMMIT_REF_NAME}"                        \
+                     --build-arg PROJECT_URL="${PROJECT_URL}"                           \
+                     --build-arg PROJECT_NAMESPACE="${CI_PROJECT_NAMESPACE}"            \
+                     --build-arg PROJECT_PATH="${CI_PROJECT_PATH}"                      \
+                     --build-arg PROJECT_NAME="${CI_PROJECT_NAME}"                      \
+                     --build-arg JOB_USER="${JOB_USER}"                                 \
+                     --build-arg JOB_TOKEN="${CI_JOB_TOKEN}"                            \
+                     --build-arg USER_NAME="${GITLAB_USER_NAME}"                        \
+                     --build-arg USER_EMAIL="${GITLAB_USER_EMAIL}"                      \
+                     -t ${CONTAINER_IMAGE}:latest                                       \
+                     -t ${CONTAINER_IMAGE}:${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_NAME} \
+                     -t ${CONTAINER_IMAGE}:${CI_COMMIT_REF_NAME} .
+    - docker push ${CONTAINER_IMAGE}
+    - docker rmi ${CONTAINER_IMAGE}:latest
+    - docker rmi ${CONTAINER_IMAGE}:${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_NAME}
+    - docker rmi ${CONTAINER_IMAGE}:${CI_COMMIT_REF_NAME}
+  only:
+    - branches
+    - tags
+  tags:
+    - dockerimage
+
+
+deploy:
+  stage: deploy
+  image: reg-ext.w6d.io/w6d/library/kubectl
+  variables:
+    CHART_PROJECT: "cxcm"
+    CHART_NAME: "app"
+    CHART_VERSION: "v0.3.2"
+    CX_CHART_ENABLE: "true"
+  script:
+    - helm_init
+    - |
+      export HELM_SET_TAG="--set image.tag=${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_NAME}"
+      export HELM_SET_REP="--set image.repository=${CONTAINER_IMAGE}"
+      export HELM_SET_URL=""
+      export HELM_SET_URI=""
+      export HELM_SET_NS="--namespace ${CI_COMMIT_SHORT_SHA}"
+      export HELM_SET_INGRESS="--set ingress.enabled=false"
+      export HELM_SET_NAME="${CI_PROJECT_NAME}-${CI_COMMIT_SHORT_SHA}"
+      export HELM_VS="--version v0.4.0"
+      export HELM_SET_PORT="--set service.internalPort=8080"
+      export HELM_OPTS="${HELM_SET_TAG} ${HELM_SET_REP} ${HELM_SET_URL} ${HELM_SET_NS} ${HELM_VS} ${HELM_SET_PORT} ${HELM_SET_URI} ${HELM_SET_INGRESS}"
+      touch /tmp/values.yaml
+      echo "env:" > /tmp/values.yaml
+      echo "- name: NODE_ENV" >> /tmp/values.yaml
+      echo "  value: 'production'" >> /tmp/values.yaml
+      echo "- name: PORT" >> /tmp/values.yaml
+      echo "  value: '8080'" >> /tmp/values.yaml
+      export HELM_SET_ENV="--values /tmp/values.yaml"
+      export HELM_OPTS="${HELM_OPTS} ${HELM_SET_ENV}"
+    - echo ${HELM_OPTS}
+    - echo ${HELM_SET_NAME}
+    - helm upgrade --install --force ${HELM_OPTS} ${HELM_SET_NAME} cxcm/app
+    - wait_deploy "${HELM_SET_NAME}"
+  only:
+    - tags
+  except:
+    - /^prod-/
+  tags:
+    - helm
+
+deploy:prod:
+  stage: deploy
+  variables:
+    CHART_PROJECT: "cxcm"
+    CHART_NAME: "app"
+    CHART_VERSION: "v0.3.2"
+    CX_CHART_ENABLE: "true"
+  script:
+    - helm_init
+    - |
+      export HELM_SET_TAG="--set image.tag=${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_NAME}"
+      export HELM_SET_REP="--set image.repository=${CONTAINER_IMAGE}"
+      export HELM_SET_URL="--set ingress.host=35gwolxbwgjqykor.staging.w6d.io --set ingress.class=ing-stag --set ingress.prefix=ingress.staging.w6d.io"
+      export HELM_SET_URI="--set ingress.path='/'"
+      export HELM_SET_NS="--namespace prod-cx-${CI_PROJECT_ID}"
+      export HELM_SET_NAME="${CI_PROJECT_NAME}-${CI_PROJECT_ID}"
+      export HELM_SET_INGRESS="--set ingress.enabled=true"
+      export HELM_VS="--version v0.4.0"
+      export HELM_SET_PORT="--set service.internalPort=8080"
+      export HELM_OPTS="${HELM_SET_TAG} ${HELM_SET_REP} ${HELM_SET_URL} ${HELM_SET_NS} ${HELM_VS} ${HELM_SET_PORT} ${HELM_SET_URI} ${HELM_SET_INGRESS}"
+      touch /tmp/values.yaml
+      echo "env:" > /tmp/values.yaml
+      echo "- name: NODE_ENV" >> /tmp/values.yaml
+      echo "  value: 'production'" >> /tmp/values.yaml
+      echo "- name: PORT" >> /tmp/values.yaml
+      echo "  value: '8080'" >> /tmp/values.yaml
+      export HELM_SET_ENV="--values /tmp/values.yaml"
+      export HELM_OPTS="${HELM_OPTS} ${HELM_SET_ENV}"
+    - helm upgrade --install --force ${HELM_OPTS} ${HELM_SET_NAME} cxcm/app
+    - wait_deploy "${HELM_SET_NAME}"
+  only:
+    - tags
+  except:
+    - /^wildcard-/
+  tags:
+    - deploy
+
+cleanup:stop:
+  stage: cleanup
+  image: reg-ext.w6d.io/w6d/library/kubectl
+  script:
+    - helm delete --purge ${CI_PROJECT_NAME}-${CI_COMMIT_SHORT_SHA}
+    - kubectl delete ns ${CI_COMMIT_SHORT_SHA}
+  allow_failure: true
+  dependencies:
+    - deploy
+  only:
+    - /^wildcard-/
+
+cleanup:onfailure:
+  stage: cleanup
+  image: reg-ext.w6d.io/w6d/library/kubectl
+  script:
+    - helm delete --purge ${CI_PROJECT_NAME}-${CI_COMMIT_SHORT_SHA}
+    - kubectl delete ns ${CI_COMMIT_SHORT_SHA}
+  allow_failure: true
+  dependencies:
+    - deploy
+  when: on_failure
+  only:
+    - /^wildcard-/
+
+cleanup:onfailure:
+  stage: cleanup
+  image: reg-ext.w6d.io/w6d/library/kubectl
+  script:
+    - helm delete --purge ${CI_PROJECT_NAME}-${CI_PROJECT_ID}
+    - kubectl delete ns prod-cx-${CI_PROJECT_ID}
+  allow_failure: true
+  dependencies:
+    - deploy:prod
+  when: on_failure
+  only:
+    - /^prod-/
+
+
+##
+## functions
+##
+.fcts: &fcts |
+  function get_chart_version {
+    repopath=$1
+    grep -i version ${repopath}/Chart.yaml | awk '{print $NF}'
+  }
+  function helm_push {
+    chart_path=$1
+    version=$(get_chart_version $chart_path)
+    chartrepo=$(dirname $chart_path)
+    chartname=$(basename $chart_path)
+    helm repo add w6d https://reg.w6d.io/chartrepo/${chartrepo} --username=$HARBOR_USER --password=$HARBOR_PASSWD
+    pushd $chartrepo
+    helm push --version=v${version} $chartname w6d
+    helm repo remove w6d
+    popd
+  }
+  function get_helm_released_deployement() {
+    if [ -z "$1" ] ; then
+      echo "Mission release name for get_helm_released_deployement"
+      return 1
+    fi
+    RELEASE_NAME=$1
+    helm get manifest ${RELEASE_NAME} | yq -r '. | select((.kind=="Deployment") or (.kind=="StatefulSet") or (.kind=="DaemonSet")) | .kind+"/"+.metadata.name'
+  }
+  function wait_deploy() {
+    if [ -z "$1" ] ; then
+      echo "Missing argument: wait_deploy <release name>"
+      return 1
+    fi
+    RELEASE_NAME=$1
+    NS=$(get_helm_ns ${RELEASE_NAME})
+    for resource in $(get_helm_released_deployement ${RELEASE_NAME})
+    do
+      kubectl --namespace "${NS}" rollout status -w ${resource}
+    done
+    return 0
+  }
+  function set_chart_env() {
+    export CI_CHART_PROJECT=${CHART_PROJECT}
+    if [ -n "${LOCAL_CHART_PROJECT}" ]; then
+      export CI_CHART_PROJECT=${LOCAL_CHART_PROJECT}
+    fi
+    export CI_CHART_NAME=${CHART_NAME}
+    if [ -n "${LOCAL_CHART_NAME}" ]; then
+      export CI_CHART_NAME=${LOCAL_CHART_NAME}
+    fi
+    echo "CI_CHART_NAME=${CI_CHART_NAME}"
+    export CI_CHART_VERSION=${CHART_VERSION}
+    if [ -n "${LOCAL_CHART_VERSION}" ]; then
+      export CI_CHART_VERSION=${LOCAL_CHART_VERSION}
+    fi
+    echo "CI_CHART_VERSION=${CI_CHART_VERSION}"
+  }
+  function helm_init() {
+    helm init
+    set_chart_env
+    if [ ! -z "${HARBOR_USER}" ]; then
+      if [ -z "${CI_CHART_PROJECT}" ]; then
+        CI_CHART_PROJECT=${CI_PROJECT_NAMESPACE}
+      fi
+      echo "CI_CHART_PROJECT=${CI_CHART_PROJECT}"
+      helm repo add w6d https://reg.w6d.io/chartrepo/${CI_CHART_PROJECT} --username=${HARBOR_USER} --password=${HARBOR_PASSWD}
+    fi
+    if [ ! -z "${CX_CHART_ENABLE}" ] && [ "${CX_CHART_ENABLE}" = "true" ]; then
+      echo "CXCM charts enabled"
+      helm repo add cxcm https://reg.w6d.io/chartrepo/cxcm
+    fi
+    helm repo update
+  }
+  function git_tag_exists() {
+    tag_ref=$1
+    echo "check whether tag ${tag_ref} exists"
+    status_code=$(curl -s -o /dev/stderr -w "%{http_code}" -XGET -H "PRIVATE-TOKEN: ${TAG_TOKEN}"  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags/v${tag_ref}" 2>/dev/null)
+    [ "${status_code}" = "404" ] || {
+      echo "Status code ${status_code} and tag seems exists"
+      return 1
+    }
+  }
+  function git_last_tag() {
+    curl -s -XGET -H "PRIVATE-TOKEN: ${TAG_TOKEN}"  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags" | jq -r '.[].name' | grep "^v" | head -1 2>/dev/null
+  }
+
+  function git_last_minor_tag() {
+    current_version=$(get_version)
+    curl -s -XGET -H "PRIVATE-TOKEN: ${TAG_TOKEN}"  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags" | jq -r '.[].name' | grep "^v${current_version%.*}" | head -1 2>/dev/null
+  }
+  function get_helm_ns() {
+    if [ -z "$1" ]; then
+      echo "get_helm_ns need release name"
+      return 1
+    fi
+    helm list $1 --output json | jq -r '.Releases[0]["Namespace"]'
+  }
+  function get_version() {
+    sed -n 's/.*"version":.*"\(.*\)".*/\1/p' metadata.json || {
+      echo "error get version"
+      return 1
+    }
+    return 0
+  }
+  function get_model_version() {
+    sed -n 's/.*"model":.*"\(.*\)".*/\1/p' metadata.json || {
+      echo "get model got error"
+      return 1
+    }
+    return 0
+  }
+  function git_tag() {
+    if [ -z "$1" ] ; then
+      echo "You must set tag as parameter"
+      return 1
+    fi
+    tag_ref=$1
+    echo "create tag ${tag_ref}"
+    data="message=Autogenerate%20Release%20v$tag_ref&id=$CI_PROJECT_ID&tag_name=v$tag_ref&ref=$CI_COMMIT_SHA&release_description=Autogenerate%20Release%20v$tag_ref"
+    status_code=$(curl -s -o /dev/stderr -w "%{http_code}\n" -XPOST -H "PRIVATE-TOKEN: $TAG_TOKEN" -d "$data" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags" 2>/dev/null )
+    [ "${status_code}" = "201" ] || {
+      echo "Status code ${status_code}"
+      return 1
+    }
+    return 0
+  }
+  function set_values_yaml() {
+    if [ -z "$1" ] ; then
+      echo "You must set values name"
+      return 1
+    fi
+    VALUES_YAML=""
+    name=$(echo $1 | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+    echo "search env : VALUES_YAML_$name"
+    RES=$(eval echo \$"{VALUES_YAML_$name}")
+    if [ -z "$RES" ] ; then
+      echo "VALUES_YAML_$name not found"
+      echo "get VALUES_YAML_DEVELOPMENT"
+      RES=$(eval echo \$"VALUES_YAML_DEVELOPMENT")
+    fi
+    [ ! -z "$RES" ] && [ -f "$RES" ] && {
+      echo "create values.yaml"
+        VALUES_YAML="--values $RES"
+    }
+    export VALUES_YAML
+    return 0
+  }
+  function set_extra_values_yaml() {
+    if [ -z "$1" ] ; then
+      echo "You must set extra values name"
+      return 1
+    fi
+    EXTRA_VALUES=""
+    name=$(echo $1 | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+    echo "search env : EXTRA_VALUES_$name"
+    RES=$(eval echo \$"{EXTRA_VALUES_$name}")
+    if [ -z "$RES" ] ; then
+      echo "EXTRA_VALUES_$name not found"
+    fi
+    [ ! -z "$RES" ] && [ -f "$RES" ] && {
+      echo "create extra_values.yaml"
+        EXTRA_VALUES="--values $RES"
+    }
+    export EXTRA_VALUES
+    return 0
+  }
+  function set_kube_config() {
+    kubectl cluster-info 2>/dev/null >/dev/null | awk -F'/' '/master/ {print $3}' 2>/dev/null >/dev/null || {
+      echo "Login failed against api trying production configuration..."
+      if [[ -z "${KUBE_CA_PROD}" ]] || [[ -z "${KUBE_CRT_PROD}" ]] || [[ -z "${KUBE_KEY_PROD}" ]] ; then
+        echo "Production kube config missing"
+        return 1
+      fi
+      cp ${KUBE_CA_PROD} /root/.kube/ca.crt
+      cp ${KUBE_CRT_PROD} /root/.kube/tls.crt
+      cp ${KUBE_KEY_PROD} /root/.kube/tls.key
+      kubectl --insecure-skip-tls-verify cluster-info 2>/dev/null | awk -F'/' '/master/ {print $3}' 2>/dev/null || {
+        echo "Kubernetes login failed"
+        return 2
+      }
+    }
+    echo "Successful login"
+    return 0
+  }
+  function is_main_kong_service_exists() {
+    environment=$1
+    service=$2
+    KONG_ADDRESS=${KONG_SVC_STAGING-$KONG_SVC_PROD}
+    [[ "${environment}" == "prod" ]] && KONG_ADDRESS=$KONG_SVC_PROD
+    [[ -z "${KONG_ADDRESS}" ]] && return 2
+    ret=$(curl -X GET "http://${KONG_ADDRESS}/services/${environment}-${service}-${CI_PROJECT_NAME_SLUG}/")
+    if [[ '{"message":"Not found"}' != $ret ]]; then
+      echo "ROUTE AND SERVICE ON KONG ALREADY EXIST"
+      return 0
+    fi
+    echo "I HAVE TO CREATE ROUTE AND SERVICE ON KONG"
+    return 1
+  }
+  function is_kong_service_exists() {
+    environment=$1
+    service=$2
+    KONG_ADDRESS=${KONG_SVC_STAGING-$KONG_SVC_PROD}
+    PATCH_VERSION=$(get_version)
+    MINOR_VERSION=${PATCH_VERSION%.*}
+    [[ "${environment}" == "prod" ]] && KONG_ADDRESS=$KONG_SVC_PROD
+    [[ -z "${KONG_ADDRESS}" ]] && return 2
+    ret=$(curl -X GET "http://${KONG_ADDRESS}/services/${environment}-${service}-${CI_PROJECT_NAME_SLUG}-${NINOR_VERSION}/")
+    if [[ '{"message":"Not found"}' != $ret ]]; then
+      echo "ROUTE AND SERVICE ON KONG ALREADY EXIST"
+      return 0
+    fi
+    echo "I HAVE TO CREATE ROUTE AND SERVICE ON KONG"
+    return 1
+  }
+  function kong_create_service() {
+    service_name=$1
+    endpoint=$2
+    port=$3
+
+    KONG_ADDRESS=${KONG_SVC_STAGING-$KONG_SVC_PROD}
+    [[ "${ENVIRONMENT}" == "prod" ]] && KONG_ADDRESS=$KONG_SVC_PROD
+    [[ -z "${KONG_ADDRESS}" ]] && return 1
+
+    echo -e "\nCreate service ${service_name} point to ${endpoint}"
+    curl -s -X POST --url http://${KONG_ADDRESS}/services/  --data "name=${service_name}" \
+                                                            --data "host=${endpoint}"     \
+                                                            --data "port=${port}"         \
+                                                            --data "path=/"
+  }
+  function kong_update_service() {
+      service_name=$1
+      endpoint=$2
+
+      echo -e "\nUpdating service ${service_name} to ${endpoint}"
+      curl -s -X PATCH --url http://${KONG_ADDRESS}/services/${service_name} --data "host=${endpoint}"
+
+  }
+  function kong_create_route() {
+    service_name=$1
+    route_domain=$2
+    route_path=$3
+    strip_path=$4
+
+    KONG_ADDRESS=${KONG_SVC_STAGING-$KONG_SVC_PROD}
+    [[ "${ENVIRONMENT}" == "prod" ]] && KONG_ADDRESS=$KONG_SVC_PROD
+    [[ -z "${KONG_ADDRESS}" ]] && return 1
+
+    echo -e "\nCreate route ${route_domain}${route_path} on service ${service_name}"
+    curl -s -X POST --url http://${KONG_ADDRESS}/services/${service_name}/routes --data "hosts[]=${route_domain}"  \
+                                                                                 --data "paths[]=${route_path}"    \
+                                                                                 --data "strip_path=${strip_path}" \
+                                                                                 --data "preserve_host=true"
+  }
+  function kong_active_plugin() {
+    service_name=$1
+    plugin=$2
+    KONG_ADDRESS=${KONG_SVC_STAGING-$KONG_SVC_PROD}
+    [[ "${ENVIRONMENT}" == "prod" ]] && KONG_ADDRESS=$KONG_SVC_PROD
+    [[ -z "${KONG_ADDRESS}" ]] && return 1
+
+    echo -e "\nEnable plugin ${plugin} on ${service_name}"
+    curl -X POST http://${KONG_ADDRESS}/services/${service_name}/plugins --data "name=${plugin}"
+  }
+  function kong_main_version() {
+    environment=$1
+    service=$2
+    resource=$3
+    endpoint=$4 # host.svc.cluster.local
+    fqdn=$5
+
+    [[ ! version_is_newest ]] && {
+      echo "It's not ther higher version, nothing to change on kong higher deploy"
+      return 0
+    }
+    if is_main_kong_service_exists $environment $service ; then
+      kong_update_service "${environment}-${service}-${CI_PROJECT_NAME_SLUG}" "${endpoint}"
+    else
+      kong_create_service "${environment}-${service}-${CI_PROJECT_NAME_SLUG}" "${endpoint}" "8080"
+      kong_create_route "${environment}-${service}-${CI_PROJECT_NAME_SLUG}" "${fqdn}" "/${service}/${resource}" "false"
+      kong_active_plugin "${environment}-${service}-${CI_PROJECT_NAME_SLUG}" "key-auth"
+    fi
+  }
+  function set_kong() {
+    MINOR_VERSION=${VERSION%.*}
+    VERSION_SLUG=${VERSION//./-}
+    MINOR_VERSION_SLUG=${MINOR_VERSION//./-}
+    service=$( basename $(dirname $CI_PROJECT_PATH))
+    add_kong ${ENVIRONMENT} $service ${CI_PROJECT_NAME} "${HELM_RELEASE_PREFIX}${CI_ENVIRONMENT_SLUG}.${HELM_NS}.svc.cluster.local" ${FQDN}
+  }
+  function add_kong() {
+    if [[ -z "$5" ]]; then
+      return 1
+    fi
+    environment=$1
+    service=$2
+    resource=$3
+    endpoint=$4 # host.svc.cluster.local
+    fqdn=$5
+
+    [[ ! minor_version_is_newest ]] && {
+      echo -e "\nIt's not the highest minor version, nothing to change on kong"
+      return 0
+    }
+    PATCH_VERSION=$(get_version)
+    MINOR_VERSION=${PATCH_VERSION%.*}
+    KONG_ADDRESS=${KONG_SVC_STAGING-$KONG_SVC_PROD}
+    [[ "${environment}" == "prod" ]] && KONG_ADDRESS=$KONG_SVC_PROD
+    if is_kong_service_exists $environment $service ; then
+      kong_update_service "${environment}-${service}-${CI_PROJECT_NAME_SLUG}-${MINOR_VERSION}" "${endpoint}"
+    else
+      kong_create_service "${environment}-${service}-${CI_PROJECT_NAME_SLUG}-${MINOR_VERSION}" "${endpoint}" "8080"
+      kong_create_route   "${environment}-${service}-${CI_PROJECT_NAME_SLUG}-${MINOR_VERSION}" "${fqdn}" "/${service}/${resource}" "false"
+      kong_active_plugin  "${environment}-${service}-${CI_PROJECT_NAME_SLUG}-{MINOR_VERSION}" "key-auth"
+    fi
+    kong_main_version $environment $service $resource $endpoint $fqdn
+  }
+  function builddocker() {
+    [ -z "${BUILD_DOCKER_PARAMS}" ] && BUILD_DOCKER_PARAMS=""
+    COMMIT_REF_NAME=${CI_COMMIT_REF_NAME/feature\//}
+    BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    VCS_REF=$(git rev-parse --short HEAD)
+    docker build --build-arg VCS_REF=${VCS_REF}                                  \
+                 --build-arg BUILD_DATE=${BUILD_DATE}                            \
+                 --build-arg VERSION="${COMMIT_REF_NAME}"                        \
+                 --build-arg PROJECT_URL="${PROJECT_URL}"                        \
+                 --build-arg PROJECT_NAMESPACE="${CI_PROJECT_NAMESPACE}"         \
+                 --build-arg PROJECT_PATH="${CI_PROJECT_PATH}"                   \
+                 --build-arg PROJECT_NAME="${CI_PROJECT_NAME}"                   \
+                 --build-arg JOB_USER="${JOB_USER}"                              \
+                 --build-arg JOB_TOKEN="${CI_JOB_TOKEN}"                         \
+                 --build-arg USER_NAME="${GITLAB_USER_NAME}"                     \
+                 --build-arg USER_EMAIL="${GITLAB_USER_EMAIL}"                   \
+                 ${BUILD_DOCKER_PARAMS}                                          \
+                 -t ${CONTAINER_IMAGE}:latest                                    \
+                 -t ${CONTAINER_IMAGE}:${CI_COMMIT_SHORT_SHA}-${COMMIT_REF_SLUG} \
+                 -t ${CONTAINER_IMAGE}:${COMMIT_REF_SLUG} .
+    docker push ${CONTAINER_IMAGE}
+    docker rmi ${CONTAINER_IMAGE}:latest
+    docker rmi ${CONTAINER_IMAGE}:${CI_COMMIT_SHORT_SHA}-${COMMIT_REF_SLUG}
+    docker rmi ${CONTAINER_IMAGE}:${COMMIT_REF_SLUG}
+  }
+
+  function version_is_newest() {
+    major_version=$(git_last_tag)
+    repo_version=${major_version//v/}
+    current_version=$(get_version)
+    if [ "$(printf '%s\n' "${current_version}" "${repo_version}" | sort -V | head -n1)" = "${repo_version}" ]; then
+      echo -e "\nNew higher version detected"
+      return 0
+    else
+      echo -e "\nIt's not the higher version"
+      return 1
+    fi
+  }
+
+  function minor_version_is_newest() {
+    minor_version=$(git_last_minor_tag)
+    repo_version=${minor_version//v/}
+    current_version=$(get_version)
+    if [ "$(printf '%s\n' "${current_version}" "${repo_version}" | sort -V | head -n1)" = "${repo_version}" ]; then
+      echo -e "\nNew highest minor version detected"
+      return 0
+    else
+      echo -e "\nIt's not the highest minor version"
+      return 1
+    fi
+  }
+
+before_script:
+  - *fcts
+  - export CI_COMMIT_SHA_SHORT=${CI_COMMIT_SHA:0:8}
+  - export CI_PROJECT_NAME_SLUG=${CI_PROJECT_NAME//./-}
+  - export VERSION=$(get_version)
+  - export MODEL_VERSION=$(get_model_version)
+  - |
+    export FEATURE_NAME=""
+    [ "${CI_COMMIT_REF_NAME/feature\//}" = "${CI_COMMIT_REF_NAME}" ] || export FEATURE_NAME=${CI_COMMIT_REF_NAME/feature\//}
+
+
+
